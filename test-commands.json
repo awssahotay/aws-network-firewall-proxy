@@ -1,0 +1,20 @@
+{
+  "description": "Test commands to run from workload instance after deployment",
+  "note": "Replace <LATTICE_RESOURCE_DNS> with the actual DNS from your deployment",
+  "how_to_get_lattice_dns": "Run: aws vpc-lattice list-service-network-resource-associations --service-network-identifier <SERVICE_NETWORK_ID> --query 'items[*].dnsEntry.domainName' --output text",
+  "commands": [
+    "echo '=== DNS Resolution ==='",
+    "nslookup <LATTICE_RESOURCE_DNS>",
+    "echo ''",
+    "echo '=== TCP Connectivity ==='",
+    "timeout 5 bash -c 'echo > /dev/tcp/<LATTICE_RESOURCE_DNS>/3128' 2>/dev/null && echo 'TCP connection successful' || echo 'TCP connection failed'",
+    "echo ''",
+    "echo '=== HTTP CONNECT Test (HTTPS via proxy) ==='",
+    "curl -v --proxy http://<LATTICE_RESOURCE_DNS>:3128 --connect-timeout 10 https://docs.aws.amazon.com -o /dev/null 2>&1 | head -40",
+    "echo ''",
+    "echo '=== HTTP GET Test ==='",
+    "curl -v --proxy http://<LATTICE_RESOURCE_DNS>:3128 --connect-timeout 10 http://example.com -o /dev/null 2>&1 | head -30"
+  ],
+  "example_lattice_dns": "snra-095a85f699337298c.rcfg-05b0ef60274ea0b03.4232ccc.vpc-lattice-rsc.us-east-2.on.aws",
+  "important": "DO NOT use the NFW Proxy VPCE domain directly (vpce-xxx.proxy.nfw...). Use the Lattice Resource DNS which resolves to VPC Lattice IPs (129.224.x.x or 169.254.x.x)"
+}
