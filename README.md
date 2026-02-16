@@ -189,17 +189,6 @@ All other domains return 403 Forbidden.
 | `curl --proxy ... https://google.com` | 403 Forbidden (blocked by FQDN filter) |
 | `curl --proxy ... https://example.com` | 200 Connection Established (allowed) |
 
-## Cost Estimate (600 VPCs, 50TB/month)
-
-| Component | Monthly Cost |
-|-----------|--------------|
-| NFW Proxy (3 AZ) | ~$519 |
-| VPC Lattice Service | ~$18 |
-| Data Processing (50TB) | ~$4,500 |
-| **Total** | **~$5,037** |
-
-Note: VPC Lattice VPC associations are FREE. NAT Gateway costs are waived when service-chained with NFW.
-
 ## Troubleshooting
 
 ### proxy.internal returns NXDOMAIN
