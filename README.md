@@ -147,17 +147,6 @@ curl --proxy http://vpce-xxx.proxy.nfw.us-east-2.vpce.amazonaws.com:3128 https:/
 | `docs.aws.amazon.com` | 200 Connection Established |
 | `google.com` | 403 Forbidden (FQDN filtering) |
 
-## Cost Estimate (600 VPCs, 50TB/month)
-
-| Component | Monthly Cost |
-|-----------|--------------|
-| NFW Proxy (3 AZ) | ~$519 |
-| VPC Lattice Service | ~$18 |
-| Data Processing (50TB) | ~$4,500 |
-| **Total** | **~$5,037** |
-
-Note: VPC Lattice VPC associations are FREE. NAT Gateway costs are waived when service-chained with NFW.
-
 ## Troubleshooting
 
 ### proxy.internal returns NXDOMAIN
