@@ -619,7 +619,7 @@ RAM_SHARE_ARN=$(aws ram create-resource-share \
     --name ${STACK_PREFIX}-lattice-share \
     --resource-arns $SERVICE_NETWORK_ARN \
     --principals $WORKLOAD_DEV_ACCOUNT $WORKLOAD_TEST_ACCOUNT \
-    --allow-external-principals false \
+    --no-allow-external-principals \
     --region $REGION \
     --profile $PROFILE \
     --query 'resourceShare.resourceShareArn' --output text 2>/dev/null || \
