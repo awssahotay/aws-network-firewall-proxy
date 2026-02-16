@@ -119,37 +119,93 @@ After deployment, connect to a test instance via SSM:
 # Get instance ID from deployment output, then:
 aws ssm start-session --target <INSTANCE_ID> --profile <YOUR_DEV_PROFILE> --region us-east-2
 
-# Test with friendly DNS (recommended)
-curl -I --proxy http://proxy.internal:3128 https://docs.aws.amazon.com
+# Test DNS resolution (should return 129.224.x.x)
+nslookup egress.proxy.internal
+
+# Test allowed domain (should return 200)
+curl -I --proxy http://egress.proxy.internal:3128 https://docs.aws.amazon.com
 
 # Test blocked domain (should return 403)
-curl -I --proxy http://proxy.internal:3128 https://google.com
+curl -I --proxy http://egress.proxy.internal:3128 https://google.com
+```
+
+## Validated Test Results (February 16, 2026)
+
+```bash
+# DNS Resolution - SUCCESS
+sh-5.2$ nslookup egress.proxy.internal
+Server:         10.0.0.2
+Address:        10.0.0.2#53
+
+egress.proxy.internal   canonical name = snra-xxx.rcfg-xxx.vpc-lattice-rsc.us-east-2.on.aws.
+Name:   snra-xxx.rcfg-xxx.vpc-lattice-rsc.us-east-2.on.aws
+Address: 129.224.52.0
+
+# Allowed Domain (AWS) - SUCCESS
+sh-5.2$ curl -I --proxy http://egress.proxy.internal:3128 https://docs.aws.amazon.com
+HTTP/1.1 200 Connection Established
+HTTP/1.1 200 OK
+...
+
+# Blocked Domain (Google) - SUCCESS (403 Forbidden)
+sh-5.2$ curl -I --proxy http://egress.proxy.internal:3128 https://google.com
+HTTP/1.1 403 Forbidden
+Content-Type: text/plain; charset=utf-8
+curl: (56) CONNECT tunnel failed, response 403
 ```
 
 ## Important: Use Lattice DNS, Not VPCE Domain
 
 ```bash
-# CORRECT - Friendly DNS
-curl --proxy http://proxy.internal:3128 https://docs.aws.amazon.com
+# CORRECT - Friendly DNS (via PHZ CNAME)
+curl --proxy http://egress.proxy.internal:3128 https://docs.aws.amazon.com
 
-# CORRECT - Lattice Resource DNS
+# CORRECT - Lattice Resource DNS (always works)
 curl --proxy http://snra-xxx.rcfg-xxx.vpc-lattice-rsc.us-east-2.on.aws:3128 https://docs.aws.amazon.com
 
-# WRONG - Direct VPCE domain (no route from workload VPC)
+# WRONG - Direct VPCE domain (resolves to 172.16.x.x - no route from workload VPC)
 curl --proxy http://vpce-xxx.proxy.nfw.us-east-2.vpce.amazonaws.com:3128 https://example.com
 ```
+
+Note: The friendly DNS is `egress.proxy.internal` (CNAME), not `proxy.internal` (apex). The CNAME points to the Lattice Resource DNS.
+
+## FQDN Allowlist Rules
+
+The default configuration uses allowlist mode (PreDNS=DENY). Only these domains are allowed:
+
+| Rule | Domains |
+|------|---------|
+| allow-aws | `*.amazonaws.com`, `*.aws.amazon.com` |
+| allow-common | `example.com`, `*.example.com`, `httpbin.org` |
+
+All other domains return 403 Forbidden.
 
 ## Expected Results
 
 | Test | Expected Result |
 |------|-----------------|
-| `nslookup proxy.internal` | Lattice IP (129.224.x.x) |
-| `docs.aws.amazon.com` | 200 Connection Established |
-| `google.com` | 403 Forbidden (FQDN filtering) |
+| `nslookup egress.proxy.internal` | CNAME to Lattice DNS, then IP (129.224.x.x) |
+| `curl --proxy ... https://docs.aws.amazon.com` | 200 Connection Established |
+| `curl --proxy ... https://google.com` | 403 Forbidden (blocked by FQDN filter) |
+| `curl --proxy ... https://example.com` | 200 Connection Established (allowed) |
+
+## Cost Estimate (600 VPCs, 50TB/month)
+
+| Component | Monthly Cost |
+|-----------|--------------|
+| NFW Proxy (3 AZ) | ~$519 |
+| VPC Lattice Service | ~$18 |
+| Data Processing (50TB) | ~$4,500 |
+| **Total** | **~$5,037** |
+
+Note: VPC Lattice VPC associations are FREE. NAT Gateway costs are waived when service-chained with NFW.
 
 ## Troubleshooting
 
 ### proxy.internal returns NXDOMAIN
+Use `egress.proxy.internal` instead (CNAME record). The apex `proxy.internal` may not resolve if the Lattice IP couldn't be determined at setup time.
+
+### egress.proxy.internal returns NXDOMAIN
 The workload VPC is not associated with the Private Hosted Zone. Check PHZ associations or use the Lattice DNS directly.
 
 ### DNS resolves to 172.16.x.x
