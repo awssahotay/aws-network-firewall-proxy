@@ -1,5 +1,5 @@
 #!/bin/bash
-# NFW Proxy Test - Networking Account Setup
+# NFW Proxy + VPC Lattice - Networking Account Setup
 # 
 # This script creates:
 # - Egress VPC (172.16.0.0/16) with public and private subnets
@@ -9,23 +9,13 @@
 # - Resource Gateway
 # - Resource Configuration pointing to NFW Proxy VPCE domain
 #
-# ============================================================================
-# ⚠️  UPDATE THIS PROFILE NAME TO MATCH YOUR AWS CLI CONFIGURATION
-# ============================================================================
-PROFILE="Networking"  # <-- CHANGE THIS to your Networking account profile
-# ============================================================================
-# Profile names: Networking, Workload_Dev, Workload_Test
-
-# ============================================================================
-# ⚠️  UPDATE THESE WORKLOAD ACCOUNT IDs FOR YOUR ENVIRONMENT
-# ============================================================================
-WORKLOAD_DEV_ACCOUNT="111111111111"    # <-- CHANGE THIS to your Workload Dev account ID
-WORKLOAD_TEST_ACCOUNT="222222222222"   # <-- CHANGE THIS to your Workload Test account ID
-# ============================================================================
+# Run via deploy.sh or set environment variables:
+#   EGRESS_NETWORKING_PROFILE
+#   EGRESS_WORKLOAD_DEV_ACCOUNT, EGRESS_WORKLOAD_TEST_ACCOUNT (for RAM sharing)
+#   EGRESS_REGION (optional, default: us-east-2)
+#   EGRESS_STACK_PREFIX (optional, default: egress-proxy)
 
 set -e
-REGION="us-east-2"
-STACK_PREFIX="network-firewall-proxy"
 
 # Colors for output
 RED='\033[0;31m'
@@ -37,16 +27,38 @@ log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
 log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
+# Get configuration from environment variables or use defaults
+PROFILE="${EGRESS_NETWORKING_PROFILE:-}"
+WORKLOAD_DEV_ACCOUNT="${EGRESS_WORKLOAD_DEV_ACCOUNT:-}"
+WORKLOAD_TEST_ACCOUNT="${EGRESS_WORKLOAD_TEST_ACCOUNT:-}"
+REGION="${EGRESS_REGION:-us-east-2}"
+STACK_PREFIX="${EGRESS_STACK_PREFIX:-egress-proxy}"
+
+# Validate required parameters
+if [[ -z "$PROFILE" ]]; then
+    log_error "EGRESS_NETWORKING_PROFILE not set. Run via deploy.sh or set environment variable."
+    exit 1
+fi
+if [[ -z "$WORKLOAD_DEV_ACCOUNT" ]] || [[ -z "$WORKLOAD_TEST_ACCOUNT" ]]; then
+    log_error "EGRESS_WORKLOAD_DEV_ACCOUNT and EGRESS_WORKLOAD_TEST_ACCOUNT must be set for RAM sharing."
+    log_error "Run via deploy.sh (which derives them from profiles) or set environment variables."
+    exit 1
+fi
+
 # Get account ID
 ACCOUNT_ID=$(aws sts get-caller-identity --profile $PROFILE --query 'Account' --output text)
 log_info "Networking Account ID: $ACCOUNT_ID"
+log_info "Region: $REGION"
+log_info "Stack Prefix: $STACK_PREFIX"
+log_info "Workload Dev Account: $WORKLOAD_DEV_ACCOUNT"
+log_info "Workload Test Account: $WORKLOAD_TEST_ACCOUNT"
 
 # ============================================================================
 # STEP 1: Create Egress VPC with CloudFormation
 # ============================================================================
 log_info "Step 1: Creating Egress VPC..."
 
-cat > /tmp/egress-vpc.yaml << 'EOF'
+cat > /tmp/vpc.yaml << 'EOF'
 AWSTemplateFormatVersion: '2010-09-09'
 Description: NFW Proxy Test - Egress VPC in Networking Account
 
@@ -65,7 +77,7 @@ Resources:
       EnableDnsSupport: true
       Tags:
         - Key: Name
-          Value: !Sub '${StackPrefix}-egress-vpc'
+          Value: !Sub '${StackPrefix}-vpc'
 
   # Internet Gateway
   InternetGateway:
@@ -173,7 +185,7 @@ Outputs:
   VpcId:
     Value: !Ref EgressVPC
     Export:
-      Name: !Sub '${StackPrefix}-egress-vpc-id'
+      Name: !Sub '${StackPrefix}-vpc-id'
   
   PublicSubnetId:
     Value: !Ref PublicSubnet
@@ -375,11 +387,11 @@ while true; do
     
     if [ "$PROXY_STATE" == "ATTACHED" ]; then
         echo ""
-        log_info "✅ Proxy is ATTACHED (took ${ELAPSED_MINS} minutes)"
+        log_info "Proxy is ATTACHED (took ${ELAPSED_MINS} minutes)"
         break
     elif [ "$PROXY_STATE" == "ATTACH_FAILED" ]; then
         echo ""
-        log_error "❌ Proxy attachment failed!"
+        log_error "Proxy attachment failed!"
         aws network-firewall describe-proxy \
             --proxy-name ${STACK_PREFIX}-proxy \
             --query 'Proxy.{FailureCode:FailureCode,FailureMessage:FailureMessage}' \
@@ -390,7 +402,7 @@ while true; do
     # Check if we've exceeded max wait time
     if [ $ELAPSED_MINS -ge $MAX_WAIT_MINS ]; then
         echo ""
-        log_error "❌ Timeout waiting for proxy after ${MAX_WAIT_MINS} minutes"
+        log_error "Timeout waiting for proxy after ${MAX_WAIT_MINS} minutes"
         log_error "Current state: $PROXY_STATE"
         exit 1
     fi
@@ -415,55 +427,54 @@ echo "$PROXY_DETAILS" | jq '.'
 VPCE_SERVICE_NAME=$(echo "$PROXY_DETAILS" | jq -r '.Proxy.VpcEndpointServiceName')
 log_info "VPCE Service Name: $VPCE_SERVICE_NAME"
 
-# Find VPC endpoints created by the proxy using the exact service name
-log_info "Looking for NFW Proxy VPC Endpoint..."
-sleep 5  # Give time for endpoint to be created
+# Find VPC endpoints created by the proxy with retry logic
+log_info "Looking for NFW Proxy VPC Endpoint (with retries)..."
 
-NFW_VPCE=$(aws ec2 describe-vpc-endpoints \
-    --filters "Name=vpc-id,Values=$VPC_ID" "Name=service-name,Values=$VPCE_SERVICE_NAME" \
-    --query 'VpcEndpoints[0]' \
-    --region $REGION --profile $PROFILE 2>/dev/null)
+NFW_PROXY_VPCE_DOMAIN=""
+NFW_PROXY_VPCE_ID=""
+VPCE_RETRY_COUNT=0
+VPCE_MAX_RETRIES=12  # 12 retries x 30 seconds = 6 minutes max
 
-if [ -z "$NFW_VPCE" ] || [ "$NFW_VPCE" == "null" ]; then
-    # Fallback: list all endpoints and find the one with proxy.nfw in service name
-    log_info "Searching for NFW Proxy endpoint in VPC (fallback)..."
+while [ -z "$NFW_PROXY_VPCE_DOMAIN" ] || [ "$NFW_PROXY_VPCE_DOMAIN" == "null" ]; do
+    VPCE_RETRY_COUNT=$((VPCE_RETRY_COUNT + 1))
+    
+    if [ $VPCE_RETRY_COUNT -gt $VPCE_MAX_RETRIES ]; then
+        log_error "Failed to find NFW Proxy VPCE after $VPCE_MAX_RETRIES retries"
+        log_error "The proxy is attached but VPCE endpoint was not found."
+        log_error "This may indicate an issue with the NFW Proxy Preview feature."
+        exit 1
+    fi
+    
+    log_info "Attempt $VPCE_RETRY_COUNT/$VPCE_MAX_RETRIES: Searching for VPCE..."
+    
+    # Method 1: Search by exact service name
     NFW_VPCE=$(aws ec2 describe-vpc-endpoints \
-        --filters "Name=vpc-id,Values=$VPC_ID" \
-        --query "VpcEndpoints[?contains(ServiceName, 'proxy.nfw')] | [0]" \
+        --filters "Name=vpc-id,Values=$VPC_ID" "Name=service-name,Values=$VPCE_SERVICE_NAME" \
+        --query 'VpcEndpoints[0]' \
         --region $REGION --profile $PROFILE 2>/dev/null)
-fi
-
-if [ -n "$NFW_VPCE" ] && [ "$NFW_VPCE" != "null" ]; then
-    NFW_PROXY_VPCE_ID=$(echo $NFW_VPCE | jq -r '.VpcEndpointId')
-    NFW_PROXY_VPCE_DOMAIN=$(echo $NFW_VPCE | jq -r '.DnsEntries[0].DnsName')
-    log_info "Found NFW Proxy VPCE: $NFW_PROXY_VPCE_ID"
-    log_info "NFW Proxy VPCE Domain: $NFW_PROXY_VPCE_DOMAIN"
-else
-    # VPCE not found via EC2 API - this can happen, use PrivateDNSName from proxy as fallback
-    log_warn "Could not find NFW Proxy VPCE via EC2 API in VPC $VPC_ID"
-    log_warn "Using PrivateDNSName from proxy description as fallback..."
     
-    # The PrivateDNSName format is: <ID>.proxy.nfw.us-east-2.amazonaws.com
-    # We need to construct the VPCE domain format: vpce-xxx.<ID>.proxy.nfw.us-east-2.vpce.amazonaws.com
-    PRIVATE_DNS=$(echo "$PROXY_DETAILS" | jq -r '.Proxy.PrivateDNSName')
-    log_info "Proxy PrivateDNSName: $PRIVATE_DNS"
+    if [ -z "$NFW_VPCE" ] || [ "$NFW_VPCE" == "null" ]; then
+        # Method 2: Search by proxy.nfw pattern
+        NFW_VPCE=$(aws ec2 describe-vpc-endpoints \
+            --filters "Name=vpc-id,Values=$VPC_ID" \
+            --query "VpcEndpoints[?contains(ServiceName, 'proxy.nfw')] | [0]" \
+            --region $REGION --profile $PROFILE 2>/dev/null)
+    fi
     
-    # For now, we'll continue without the VPCE domain - the Resource Configuration
-    # will need to be created manually or we'll use an existing one
-    NFW_PROXY_VPCE_DOMAIN=""
-    NFW_PROXY_VPCE_ID=""
+    if [ -n "$NFW_VPCE" ] && [ "$NFW_VPCE" != "null" ]; then
+        NFW_PROXY_VPCE_ID=$(echo $NFW_VPCE | jq -r '.VpcEndpointId')
+        NFW_PROXY_VPCE_DOMAIN=$(echo $NFW_VPCE | jq -r '.DnsEntries[0].DnsName')
+        
+        if [ -n "$NFW_PROXY_VPCE_DOMAIN" ] && [ "$NFW_PROXY_VPCE_DOMAIN" != "null" ]; then
+            log_info "Found NFW Proxy VPCE: $NFW_PROXY_VPCE_ID"
+            log_info "NFW Proxy VPCE Domain: $NFW_PROXY_VPCE_DOMAIN"
+            break
+        fi
+    fi
     
-    log_warn "⚠️  VPCE domain not found. You may need to:"
-    log_warn "   1. Wait a few minutes and check again"
-    log_warn "   2. Find the VPCE manually in the AWS Console"
-    log_warn "   3. Use an existing Resource Configuration"
-    log_warn ""
-    log_warn "Continuing with remaining setup steps..."
-fi
-
-if [ -n "$NFW_PROXY_VPCE_DOMAIN" ]; then
-    log_info "NFW Proxy VPCE Domain: $NFW_PROXY_VPCE_DOMAIN"
-fi
+    log_info "VPCE not ready yet, waiting 30 seconds..."
+    sleep 30
+done
 
 # ============================================================================
 # STEP 5: Create VPC Lattice Service Network
@@ -534,74 +545,66 @@ done
 # ============================================================================
 log_info "Step 7: Creating Resource Configuration..."
 
-# Check if we have a VPCE domain to use
-if [ -z "$NFW_PROXY_VPCE_DOMAIN" ]; then
-    log_warn "⚠️  Skipping Resource Configuration - no VPCE domain available"
-    log_warn "You will need to create the Resource Configuration manually once VPCE is available"
-    RESOURCE_CONFIG_ID=""
-    RESOURCE_ASSOC_ID=""
+# Check if Resource Configuration already exists
+EXISTING_RC=$(aws vpc-lattice list-resource-configurations \
+    --query "items[?name=='${STACK_PREFIX}-proxy-resource'].id" \
+    --output text --region $REGION --profile $PROFILE 2>/dev/null || echo "")
+
+if [ -n "$EXISTING_RC" ] && [ "$EXISTING_RC" != "None" ]; then
+    RESOURCE_CONFIG_ID=$EXISTING_RC
+    log_info "Using existing Resource Configuration: $RESOURCE_CONFIG_ID"
 else
-    # Check if Resource Configuration already exists
-    EXISTING_RC=$(aws vpc-lattice list-resource-configurations \
-        --query "items[?name=='${STACK_PREFIX}-proxy-resource'].id" \
-        --output text --region $REGION --profile $PROFILE 2>/dev/null || echo "")
+    RESOURCE_CONFIG_ID=$(aws vpc-lattice create-resource-configuration \
+        --name ${STACK_PREFIX}-proxy-resource \
+        --type SINGLE \
+        --resource-gateway-identifier $RESOURCE_GATEWAY_ID \
+        --port-ranges 3128 \
+        --protocol TCP \
+        --resource-configuration-definition "dnsResource={domainName=${NFW_PROXY_VPCE_DOMAIN},ipAddressType=IPV4}" \
+        --region $REGION \
+        --profile $PROFILE \
+        --query 'id' --output text)
+    log_info "Created Resource Configuration: $RESOURCE_CONFIG_ID"
+fi
 
-    if [ -n "$EXISTING_RC" ] && [ "$EXISTING_RC" != "None" ]; then
-        RESOURCE_CONFIG_ID=$EXISTING_RC
-        log_info "Using existing Resource Configuration: $RESOURCE_CONFIG_ID"
-    else
-        RESOURCE_CONFIG_ID=$(aws vpc-lattice create-resource-configuration \
-            --name ${STACK_PREFIX}-proxy-resource \
-            --type SINGLE \
-            --resource-gateway-identifier $RESOURCE_GATEWAY_ID \
-            --port-ranges 3128 \
-            --protocol TCP \
-            --resource-configuration-definition "dnsResource={domainName=${NFW_PROXY_VPCE_DOMAIN},ipAddressType=IPV4}" \
-            --region $REGION \
-            --profile $PROFILE \
-            --query 'id' --output text)
-        log_info "Created Resource Configuration: $RESOURCE_CONFIG_ID"
+# Wait for Resource Configuration to be active
+log_info "Waiting for Resource Configuration to become active..."
+while true; do
+    STATUS=$(aws vpc-lattice get-resource-configuration \
+        --resource-configuration-identifier $RESOURCE_CONFIG_ID \
+        --query 'status' --output text \
+        --region $REGION --profile $PROFILE)
+    if [ "$STATUS" == "ACTIVE" ]; then
+        log_info "Resource Configuration is ACTIVE"
+        break
     fi
+    log_info "Resource Configuration status: $STATUS - waiting..."
+    sleep 10
+done
 
-    # Wait for Resource Configuration to be active
-    log_info "Waiting for Resource Configuration to become active..."
-    while true; do
-        STATUS=$(aws vpc-lattice get-resource-configuration \
-            --resource-configuration-identifier $RESOURCE_CONFIG_ID \
-            --query 'status' --output text \
-            --region $REGION --profile $PROFILE)
-        if [ "$STATUS" == "ACTIVE" ]; then
-            log_info "Resource Configuration is ACTIVE"
-            break
-        fi
-        log_info "Resource Configuration status: $STATUS - waiting..."
-        sleep 10
-    done
+# ============================================================================
+# STEP 8: Associate Resource Configuration with Service Network
+# ============================================================================
+log_info "Step 8: Associating Resource Configuration with Service Network..."
 
-    # ============================================================================
-    # STEP 8: Associate Resource Configuration with Service Network
-    # ============================================================================
-    log_info "Step 8: Associating Resource Configuration with Service Network..."
+# Check if association already exists
+EXISTING_ASSOC=$(aws vpc-lattice list-service-network-resource-associations \
+    --service-network-identifier $SERVICE_NETWORK_ID \
+    --query "items[?resourceConfigurationId=='${RESOURCE_CONFIG_ID}'].id" \
+    --output text --region $REGION --profile $PROFILE 2>/dev/null || echo "")
 
-    # Check if association already exists
-    EXISTING_ASSOC=$(aws vpc-lattice list-service-network-resource-associations \
+if [ -n "$EXISTING_ASSOC" ] && [ "$EXISTING_ASSOC" != "None" ]; then
+    RESOURCE_ASSOC_ID=$EXISTING_ASSOC
+    log_info "Using existing association: $RESOURCE_ASSOC_ID"
+else
+    RESOURCE_ASSOC_ID=$(aws vpc-lattice create-service-network-resource-association \
         --service-network-identifier $SERVICE_NETWORK_ID \
-        --query "items[?resourceConfigurationId=='${RESOURCE_CONFIG_ID}'].id" \
-        --output text --region $REGION --profile $PROFILE 2>/dev/null || echo "")
-
-    if [ -n "$EXISTING_ASSOC" ] && [ "$EXISTING_ASSOC" != "None" ]; then
-        RESOURCE_ASSOC_ID=$EXISTING_ASSOC
-        log_info "Using existing association: $RESOURCE_ASSOC_ID"
-    else
-        RESOURCE_ASSOC_ID=$(aws vpc-lattice create-service-network-resource-association \
-            --service-network-identifier $SERVICE_NETWORK_ID \
-            --resource-configuration-identifier $RESOURCE_CONFIG_ID \
-            --region $REGION \
-            --profile $PROFILE \
-            --query 'id' --output text)
-        log_info "Created association: $RESOURCE_ASSOC_ID"
-    fi
-fi  # End of VPCE domain check
+        --resource-configuration-identifier $RESOURCE_CONFIG_ID \
+        --region $REGION \
+        --profile $PROFILE \
+        --query 'id' --output text)
+    log_info "Created association: $RESOURCE_ASSOC_ID"
+fi
 
 # ============================================================================
 # STEP 9: Share Service Network via RAM
@@ -636,16 +639,18 @@ log_info "Getting Lattice Resource DNS..."
 # Wait a moment for the association to be fully active
 sleep 5
 
-if [ -n "$RESOURCE_CONFIG_ID" ] && [ "$RESOURCE_CONFIG_ID" != "" ]; then
-    LATTICE_RESOURCE_DNS=$(aws vpc-lattice list-service-network-resource-associations \
-        --service-network-identifier $SERVICE_NETWORK_ID \
-        --query 'items[0].dnsEntry.domainName' --output text \
-        --region $REGION --profile $PROFILE)
-    
-    log_info "Lattice Resource DNS: $LATTICE_RESOURCE_DNS"
-else
-    log_warn "No Resource Configuration - Lattice Resource DNS not available"
-    LATTICE_RESOURCE_DNS=""
+LATTICE_RESOURCE_DNS=$(aws vpc-lattice list-service-network-resource-associations \
+    --service-network-identifier $SERVICE_NETWORK_ID \
+    --query 'items[0].dnsEntry.domainName' --output text \
+    --region $REGION --profile $PROFILE)
+
+log_info "Lattice Resource DNS: $LATTICE_RESOURCE_DNS"
+
+# Verify we got a valid DNS
+if [ -z "$LATTICE_RESOURCE_DNS" ] || [ "$LATTICE_RESOURCE_DNS" == "None" ]; then
+    log_error "Failed to get Lattice Resource DNS"
+    log_error "Resource Configuration may not be properly associated with Service Network"
+    exit 1
 fi
 
 # ============================================================================
@@ -653,39 +658,33 @@ fi
 # ============================================================================
 log_info "Step 10: Creating Route 53 Private Hosted Zone (proxy.internal)..."
 
-# Only create PHZ if we have a Lattice Resource DNS
-if [ -z "$LATTICE_RESOURCE_DNS" ] || [ "$LATTICE_RESOURCE_DNS" == "None" ]; then
-    log_warn "⚠️  Skipping PHZ creation - no Lattice Resource DNS available"
-    log_warn "PHZ will need to be created manually once Resource Configuration is set up"
-    PHZ_ID=""
-else
-    # Check if PHZ already exists
-    EXISTING_PHZ=$(aws route53 list-hosted-zones-by-name \
-        --dns-name "proxy.internal" \
-        --query "HostedZones[?Name=='proxy.internal.'].Id" \
-        --output text --profile $PROFILE 2>/dev/null | head -1)
+# Check if PHZ already exists
+EXISTING_PHZ=$(aws route53 list-hosted-zones-by-name \
+    --dns-name "proxy.internal" \
+    --query "HostedZones[?Name=='proxy.internal.'].Id" \
+    --output text --profile $PROFILE 2>/dev/null | head -1)
 
-    if [ -n "$EXISTING_PHZ" ] && [ "$EXISTING_PHZ" != "None" ] && [ "$EXISTING_PHZ" != "" ]; then
-        # Extract just the ID part (remove /hostedzone/ prefix)
-        PHZ_ID=$(echo $EXISTING_PHZ | sed 's|/hostedzone/||')
-        log_info "Using existing PHZ: $PHZ_ID"
+if [ -n "$EXISTING_PHZ" ] && [ "$EXISTING_PHZ" != "None" ] && [ "$EXISTING_PHZ" != "" ]; then
+    # Extract just the ID part (remove /hostedzone/ prefix)
+    PHZ_ID=$(echo $EXISTING_PHZ | sed 's|/hostedzone/||')
+    log_info "Using existing PHZ: $PHZ_ID"
+else
+    # Create PHZ - must use a VPC from the same account (Egress VPC)
+    PHZ_RESPONSE=$(aws route53 create-hosted-zone \
+        --name "proxy.internal" \
+        --vpc VPCRegion=$REGION,VPCId=$VPC_ID \
+        --caller-reference "${STACK_PREFIX}-phz-$(date +%s)" \
+        --hosted-zone-config PrivateZone=true \
+        --profile $PROFILE 2>/dev/null)
+    
+    if [ $? -eq 0 ]; then
+        PHZ_ID=$(echo $PHZ_RESPONSE | jq -r '.HostedZone.Id' | sed 's|/hostedzone/||')
+        log_info "Created PHZ: $PHZ_ID"
     else
-        # Create PHZ - must use a VPC from the same account (Egress VPC)
-        PHZ_RESPONSE=$(aws route53 create-hosted-zone \
-            --name "proxy.internal" \
-            --vpc VPCRegion=$REGION,VPCId=$VPC_ID \
-            --caller-reference "${STACK_PREFIX}-phz-$(date +%s)" \
-            --hosted-zone-config PrivateZone=true \
-            --profile $PROFILE 2>/dev/null)
-        
-        if [ $? -eq 0 ]; then
-            PHZ_ID=$(echo $PHZ_RESPONSE | jq -r '.HostedZone.Id' | sed 's|/hostedzone/||')
-            log_info "Created PHZ: $PHZ_ID"
-        else
-            log_error "Failed to create PHZ"
-            PHZ_ID=""
-        fi
+        log_warn "Failed to create PHZ - will use Lattice DNS directly"
+        PHZ_ID=""
     fi
+fi
 
 if [ -n "$PHZ_ID" ] && [ "$PHZ_ID" != "None" ]; then
     # Get the Lattice Resource IP for the A record
@@ -752,10 +751,7 @@ if [ -n "$PHZ_ID" ] && [ "$PHZ_ID" != "None" ]; then
     # OR we use a different approach - associate from networking account after workload VPC is created
     
     log_info "PHZ authorization will be handled by workload scripts after VPC creation"
-else
-    log_warn "Skipping PHZ creation - will use Lattice DNS directly"
-fi  # End of inner PHZ_ID check
-fi  # End of outer LATTICE_RESOURCE_DNS check
+fi  # End of PHZ_ID check
 
 # ============================================================================
 # SUMMARY
@@ -771,11 +767,7 @@ echo "  - NAT Gateway: $NAT_GW_ID"
 echo "  - NFW Proxy: ${STACK_PREFIX}-proxy"
 echo "  - Service Network: $SERVICE_NETWORK_ID"
 echo "  - Resource Gateway: $RESOURCE_GATEWAY_ID"
-if [ -n "$RESOURCE_CONFIG_ID" ]; then
 echo "  - Resource Configuration: $RESOURCE_CONFIG_ID"
-else
-echo "  - Resource Configuration: NOT CREATED (VPCE not found)"
-fi
 echo "  - RAM Share: $RAM_SHARE_ARN"
 if [ -n "$PHZ_ID" ]; then
 echo "  - Private Hosted Zone: $PHZ_ID (proxy.internal)"
@@ -795,7 +787,7 @@ if [ -n "$LATTICE_RESOURCE_DNS" ] && [ "$LATTICE_RESOURCE_DNS" != "None" ]; then
     fi
     echo ""
     echo "============================================================================"
-    echo "⚠️  IMPORTANT NOTES"
+    echo " IMPORTANT NOTES"
     echo "============================================================================"
     echo ""
     echo "  1. Workload VPCs must be associated with the PHZ to use proxy.internal"
@@ -804,41 +796,6 @@ if [ -n "$LATTICE_RESOURCE_DNS" ] && [ "$LATTICE_RESOURCE_DNS" != "None" ]; then
     echo "  3. DO NOT use the VPCE domain directly: $NFW_PROXY_VPCE_DOMAIN"
     echo "     (This resolves to 172.16.x.x which has no route from workload VPCs)"
     fi
-    echo ""
-else
-    echo "============================================================================"
-    echo "⚠️  INCOMPLETE SETUP - MANUAL STEPS REQUIRED"
-    echo "============================================================================"
-    echo ""
-    echo "  The NFW Proxy VPCE was not found automatically."
-    echo "  You need to manually:"
-    echo ""
-    echo "  1. Find the NFW Proxy VPCE in the AWS Console:"
-    echo "     - Go to VPC > Endpoints"
-    echo "     - Look for endpoint with service name containing 'proxy.nfw'"
-    echo "     - Copy the DNS name (vpce-xxx...vpce.amazonaws.com)"
-    echo ""
-    echo "  2. Create Resource Configuration:"
-    echo "     aws vpc-lattice create-resource-configuration \\"
-    echo "         --name ${STACK_PREFIX}-proxy-resource \\"
-    echo "         --type SINGLE \\"
-    echo "         --resource-gateway-identifier $RESOURCE_GATEWAY_ID \\"
-    echo "         --port-ranges 3128 \\"
-    echo "         --protocol TCP \\"
-    echo "         --resource-configuration-definition \"dnsResource={domainName=<VPCE_DNS>,ipAddressType=IPV4}\" \\"
-    echo "         --region $REGION --profile $PROFILE"
-    echo ""
-    echo "  3. Associate with Service Network:"
-    echo "     aws vpc-lattice create-service-network-resource-association \\"
-    echo "         --service-network-identifier $SERVICE_NETWORK_ID \\"
-    echo "         --resource-configuration-identifier <RESOURCE_CONFIG_ID> \\"
-    echo "         --region $REGION --profile $PROFILE"
-    echo ""
-    echo "  4. Get the Lattice Resource DNS:"
-    echo "     aws vpc-lattice list-service-network-resource-associations \\"
-    echo "         --service-network-identifier $SERVICE_NETWORK_ID \\"
-    echo "         --query 'items[0].dnsEntry.domainName' --output text \\"
-    echo "         --region $REGION --profile $PROFILE"
     echo ""
 fi
 
